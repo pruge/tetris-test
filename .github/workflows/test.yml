@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # 의존성 설치 단계가 없다. package.json 도 node_modules 도 쓰지 않는 것이
+      # 이 저장소의 규약이다 (.bb/AGENTS.md).
+      - name: 테스트
+        run: node --test test/
+
+      # 테스트가 tetris.html 을 고쳐 통과시키는 일이 없도록 강제한다.
+      # .bb/AGENTS.md: "테스트가 프로덕션 코드에 맞춘다."
+      - name: tetris.html 무변경 확인
+        run: |
+          if [ -n "$(git status --porcelain tetris.html)" ]; then
+            echo "테스트 실행이 tetris.html 을 변경했다:"
+            git --no-pager diff -- tetris.html
+            exit 1
+          fi
