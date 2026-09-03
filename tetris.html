@@ -25,6 +25,7 @@
 
     --text-bright: #e8f6ff;
     --text-dim: #7f9ab8;
+    --text-key: #b7cbe3;   /* .keys 대비 개선용 (T-007) */
 
     /* 조각 색 (JS 는 --piece-1 ~ --piece-7 을 읽는다) */
     --color-grid: #16283f;
@@ -74,7 +75,8 @@
     font-family: var(--font-display);
     display: flex;
     justify-content: center;
-    align-items: flex-start;
+    align-items: center;    /* T-007: 하단 죽은 공간 제거 — 뷰포트 중앙 정렬 */
+    min-height: 100vh;
     padding: var(--space-page);
     overflow-x: hidden;
   }
@@ -207,6 +209,13 @@
   }
   .slot--next .slot__canvas { max-width: 72px; }
 
+  /* HOLD 가 비었을 때의 시각적 구멍을 없앤다 (T-007): 점선 테두리 + 낮은 불투명도 */
+  .slot__canvas.is-empty {
+    border-style: dashed;
+    border-color: var(--hair);
+    opacity: 0.55;
+  }
+
   .keys {
     margin: 0;
     padding: var(--space-snug) 0 0;
@@ -214,8 +223,30 @@
     font-size: 0.6rem;
     line-height: 1.9;
     letter-spacing: 0.06em;
-    color: var(--text-dim);
+    color: var(--text-key);   /* T-007: 기존 --text-dim 대비 밝게 */
     list-style: none;
+  }
+
+  /* ---------- 최고 점수 ---------- */
+  .best {
+    margin: var(--space-hair) 0 0;
+    font-size: 0.6rem;
+    letter-spacing: var(--track-label);
+    color: var(--text-dim);
+  }
+  .best-label {
+    text-transform: uppercase;
+    margin-right: var(--space-hair);
+  }
+  .best .value {
+    display: inline;
+    font-family: var(--font-num);
+    font-size: 0.85rem;
+    font-weight: 600;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    text-shadow: none;
+    color: var(--text-bright);
   }
   .keys b {
     display: inline-block;
@@ -377,8 +408,36 @@
     }
   }
 
+  /* ---------- 화면 버튼: CONFIG.TOUCH_UI_MAX_PX(640px) 이하에서만 보인다.
+   * CSS 는 JS 상수를 읽을 수 없어 값을 직접 맞춰 둔다 — 값을 바꾸면 둘 다 바꿀 것. */
+  .touch-controls {
+    display: none;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: var(--space-tight);
+    width: 100%;
+    max-width: 300px;
+    margin: var(--space-rail) auto 0;
+  }
+  .touch-btn {
+    padding: var(--space-snug) 0;
+    border-radius: var(--radius-panel);
+    border: 1px solid var(--hair);
+    background: linear-gradient(180deg, var(--ink-raised), var(--ink-panel));
+    color: var(--text-bright);
+    font-family: var(--font-display);
+    font-size: 0.85rem;
+    letter-spacing: 0.04em;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  .touch-btn:active {
+    background: linear-gradient(180deg, var(--ink-panel), var(--ink-raised));
+    border-color: var(--neon-cyan);
+  }
+
   /* ---------- 좁은 화면: 320px 에서 가로 스크롤이 없어야 한다 ---------- */
   @media (max-width: 640px) {
+    .touch-controls { display: grid; }
     .deck {
       grid-template-columns: minmax(0, 1fr);
       justify-items: center;
@@ -428,6 +487,7 @@
       <section class="readout readout--major">
         <h2 class="label">Score</h2>
         <p class="value" id="score">0</p>
+        <p class="best"><span class="best-label">Best</span><span class="value" id="high-score">0</span></p>
       </section>
 
       <div class="meters">
@@ -477,6 +537,14 @@
         <li><b>R</b> 재시작</li>
       </ul>
     </aside>
+  </div>
+
+  <div class="touch-controls" id="touch-controls">
+    <button type="button" class="touch-btn" id="btn-left" aria-label="왼쪽 이동">◀</button>
+    <button type="button" class="touch-btn" id="btn-right" aria-label="오른쪽 이동">▶</button>
+    <button type="button" class="touch-btn" id="btn-rotate" aria-label="회전">⟳</button>
+    <button type="button" class="touch-btn" id="btn-hold" aria-label="홀드">HOLD</button>
+    <button type="button" class="touch-btn" id="btn-harddrop" aria-label="하드 드롭">▼▼</button>
   </div>
 </main>
 <script>
@@ -533,6 +601,15 @@ const CONFIG = {
   PREVIEW_SLOT_COLS: 4,     // 조각 모양이 들어가는 슬롯 폭(셀)
   PREVIEW_SLOT_ROWS: 3,     // 슬롯 높이(셀). 모양 2행 + 여백 1행
   HOLD_SLOT_COUNT: 1,       // 홀드 슬롯은 항상 1칸
+  // ---- 터치 (T-005b) ----
+  SWIPE_CELL_PX: 24,            // 가로로 이만큼 끌 때마다 한 칸 이동
+  SWIPE_TAP_MAX_PX: 10,         // 이동 거리가 이 이하이면 탭으로 간주
+  SWIPE_TAP_MAX_MS: 250,        // 지속 시간이 이 이하이면 탭으로 간주
+  SWIPE_DOWN_FAST_MIN_PX: 45,   // 빠른 아래 스와이프로 인정할 최소 수직 거리
+  SWIPE_DOWN_FAST_MAX_MS: 220,  // 이 시간 안에 위 거리를 넘기면 하드 드롭
+  SWIPE_DOWN_SLOW_MIN_PX: 12,   // 느린 아래 끌기로 소프트 드롭을 시작할 최소 거리
+  TOUCH_UI_MAX_PX: 640,         // 이 폭 이하에서 화면 버튼을 보인다 (CSS 640px 브레이크포인트와 일치)
+  HIGH_SCORE_KEY: 'tetris-neon-high-score',
   // SRS 월킥 오프셋: [from][to] -> [dx, dy] 5개를 순서대로 시도한다.
   // 첫 오프셋은 항상 [0,0] (밀지 않고 그대로 되는 경우).
   // 주의: 표준 SRS 표는 y 가 위로 증가한다. 이 코드의 y 는 아래로 증가하므로
@@ -787,6 +864,28 @@ function shuffled(items) {
 }
 
 /* ============================================================
+ * PERSISTENCE — 최고 점수. localStorage 를 쓸 수 없어도(file:// 제한, 예외)
+ * 게임이 죽으면 안 된다. 항상 try/catch 로 감싸고 실패 시 세션 내 값만 유지한다.
+ * ============================================================ */
+function loadHighScore() {
+  try {
+    const raw = localStorage.getItem(CONFIG.HIGH_SCORE_KEY);
+    const parsed = raw === null ? 0 : Number(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
+  } catch (err) {
+    return 0;
+  }
+}
+
+function saveHighScore(value) {
+  try {
+    localStorage.setItem(CONFIG.HIGH_SCORE_KEY, String(value));
+  } catch (err) {
+    // 저장 실패는 세션 내 state.highScore 만으로 계속 진행한다.
+  }
+}
+
+/* ============================================================
  * STATE — 보드, 현재 조각, 7-bag 큐, 낙하 누적 시간, 종료 여부.
  * ============================================================ */
 const state = {
@@ -805,6 +904,7 @@ const state = {
   isSoftDropping: false,
   hold: null,           // 보관 중인 조각 id. null 이면 보관함이 비어 있다
   canHold: true,        // 조각 하나가 고정될 때까지 홀드는 1회만
+  highScore: 0,         // T-005b: 아래에서 loadHighScore() 로 채운다. 읽기 전용 취급은 아님(우리 필드)
 };
 
 /** 7-bag 에서 다음 조각 id 하나를 뽑는다. bag 이 비면 새로 셔플해 채운다. */
@@ -834,10 +934,12 @@ function takeQueuedPieceId() {
 }
 
 state.piece = spawnPiece(takeQueuedPieceId());
+state.highScore = loadHighScore();
 
 /** 게임 규칙이 아니라 화면/조작 상태. LOGIC 은 이것을 모른다. */
 const ui = {
   isPaused: false,
+  highScoreSaved: false,   // 이번 게임오버에서 이미 저장을 시도했는가
 };
 
 /* ============================================================
@@ -943,6 +1045,7 @@ function drawSlotPiece(slotCtx, pieceId, slotIndex) {
 /** 홀드(왼쪽 1칸)와 다음 조각 미리보기(오른쪽 PREVIEW_COUNT 칸)를 그린다. */
 function renderSidePanels(currentState) {
   holdCtx.clearRect(0, 0, holdCanvas.width, holdCanvas.height);
+  holdCanvas.classList.toggle('is-empty', currentState.hold === null);
   if (currentState.hold !== null) drawSlotPiece(holdCtx, currentState.hold, 0);
 
   previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
@@ -960,13 +1063,14 @@ const hud = {
   level: document.getElementById('level'),
   lines: document.getElementById('lines'),
   finalScore: document.getElementById('final-score'),
+  highScore: document.getElementById('high-score'),
   pauseVeil: document.getElementById('veil-pause'),
   overVeil: document.getElementById('veil-over'),
 };
 
 /** 마지막으로 화면에 쓴 값. 여기와 같으면 DOM 을 건드리지 않는다. */
 const shown = {
-  score: null, level: null, lines: null, finalScore: null, veil: null,
+  score: null, level: null, lines: null, finalScore: null, highScore: null, veil: null,
 };
 
 /** 값이 바뀐 프레임에만 textContent 에 대입한다. */
@@ -991,15 +1095,32 @@ function renderVeil(currentState) {
   hud.stage.classList.toggle('is-over', veil === VEIL.OVER);
 }
 
+/** 게임오버 프레임마다 한 번, state.score 가 저장된 최고점보다 크면 갱신한다.
+ *  state.score 는 읽기만 한다 — 계산은 T-005a 의 영역이다. */
+function maybeSaveHighScore(currentState) {
+  if (!currentState.isOver) {
+    ui.highScoreSaved = false;
+    return;
+  }
+  if (ui.highScoreSaved) return;
+  ui.highScoreSaved = true;
+  if (currentState.score > state.highScore) {
+    state.highScore = currentState.score;
+    saveHighScore(state.highScore);
+  }
+}
+
 function renderHud(currentState) {
   setReadout('score', hud.score, currentState.score);
   setReadout('level', hud.level, currentState.level);
   setReadout('lines', hud.lines, currentState.clearedLines);
   setReadout('finalScore', hud.finalScore, currentState.score);
+  setReadout('highScore', hud.highScore, state.highScore);
   renderVeil(currentState);
 }
 
 function render(currentState) {
+  maybeSaveHighScore(currentState);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawGrid();
   drawBoard(currentState.board);
@@ -1160,6 +1281,120 @@ function handleKeyUp(event) {
 
 window.addEventListener('keydown', handleKeyDown);
 window.addEventListener('keyup', handleKeyUp);
+
+/** 일시정지·게임오버 중에는 터치도 무시한다. 기존 키보드 가드를 재사용한다. */
+function isTouchActive() {
+  return !(ui.isPaused || state.isOver);
+}
+
+/** 진행 중인 스와이프 제스처의 추적 상태. state 가 아니라 INPUT 소유다. */
+const touch = {
+  active: false,
+  startX: 0,
+  startY: 0,
+  startTimeMs: 0,
+  lastStepX: 0,
+  axis: null,            // 'x' | 'y' | null(아직 방향 미확정)
+  isSoftDropping: false,
+};
+
+function handleTouchStart(event) {
+  if (!isTouchActive()) return;
+  const t = event.touches[0];
+  if (!t) return;
+  touch.active = true;
+  touch.startX = t.clientX;
+  touch.startY = t.clientY;
+  touch.startTimeMs = performance.now();
+  touch.lastStepX = t.clientX;
+  touch.axis = null;
+  touch.isSoftDropping = false;
+}
+
+function handleTouchMove(event) {
+  if (!touch.active) return;
+  if (!isTouchActive()) return;
+  const t = event.touches[0];
+  if (!t) return;
+  event.preventDefault();
+
+  const dxTotal = t.clientX - touch.startX;
+  const dyTotal = t.clientY - touch.startY;
+  if (touch.axis === null
+    && (Math.abs(dxTotal) > CONFIG.SWIPE_TAP_MAX_PX || Math.abs(dyTotal) > CONFIG.SWIPE_TAP_MAX_PX)) {
+    touch.axis = Math.abs(dxTotal) >= Math.abs(dyTotal) ? 'x' : 'y';
+  }
+
+  if (touch.axis === 'x') {
+    let stepDx = t.clientX - touch.lastStepX;
+    while (Math.abs(stepDx) >= CONFIG.SWIPE_CELL_PX) {
+      const dir = stepDx > 0 ? 1 : -1;
+      pushIntent({ type: 'move', dx: dir });
+      touch.lastStepX += dir * CONFIG.SWIPE_CELL_PX;
+      stepDx = t.clientX - touch.lastStepX;
+    }
+    return;
+  }
+  if (touch.axis === 'y') {
+    const shouldSoftDrop = dyTotal >= CONFIG.SWIPE_DOWN_SLOW_MIN_PX;
+    if (shouldSoftDrop !== touch.isSoftDropping) {
+      touch.isSoftDropping = shouldSoftDrop;
+      pushIntent({ type: 'softDrop', active: shouldSoftDrop });
+    }
+  }
+}
+
+function handleTouchEnd(event) {
+  if (!touch.active) return;
+  touch.active = false;
+  if (touch.isSoftDropping) {
+    pushIntent({ type: 'softDrop', active: false });
+    touch.isSoftDropping = false;
+  }
+  const axis = touch.axis;
+  touch.axis = null;
+  if (!isTouchActive()) return;
+
+  const endTouch = event.changedTouches[0];
+  if (!endTouch) return;
+  const dxTotal = endTouch.clientX - touch.startX;
+  const dyTotal = endTouch.clientY - touch.startY;
+  const durationMs = performance.now() - touch.startTimeMs;
+
+  if (axis === null) {
+    if (Math.abs(dxTotal) <= CONFIG.SWIPE_TAP_MAX_PX
+      && Math.abs(dyTotal) <= CONFIG.SWIPE_TAP_MAX_PX
+      && durationMs <= CONFIG.SWIPE_TAP_MAX_MS) {
+      pushIntent({ type: 'rotate', dir: CONFIG.ROTATE_CW_DIR });
+    }
+    return;
+  }
+  if (axis === 'y'
+    && dyTotal >= CONFIG.SWIPE_DOWN_FAST_MIN_PX
+    && durationMs <= CONFIG.SWIPE_DOWN_FAST_MAX_MS) {
+    pushIntent({ type: 'hardDrop' });
+  }
+}
+
+canvas.addEventListener('touchstart', handleTouchStart, { passive: true });
+canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
+canvas.addEventListener('touchend', handleTouchEnd, { passive: true });
+canvas.addEventListener('touchcancel', handleTouchEnd, { passive: true });
+
+/** 화면 버튼도 같은 의도 경로를 쓴다. 새 의도 타입을 만들지 않는다. */
+function bindTouchButton(id, makeIntent) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener('click', () => {
+    if (!isTouchActive()) return;
+    pushIntent(makeIntent());
+  });
+}
+bindTouchButton('btn-left', () => ({ type: 'move', dx: -1 }));
+bindTouchButton('btn-right', () => ({ type: 'move', dx: 1 }));
+bindTouchButton('btn-rotate', () => ({ type: 'rotate', dir: CONFIG.ROTATE_CW_DIR }));
+bindTouchButton('btn-hold', () => ({ type: 'hold' }));
+bindTouchButton('btn-harddrop', () => ({ type: 'hardDrop' }));
 
 /* ============================================================
  * LOOP — 델타 타임 누적. 프레임레이트와 무관하게 낙하 간격이 같다.
@@ -1328,6 +1563,7 @@ function resetGame() {
   state.canHold = true;
   state.piece = spawnPiece(takeQueuedPieceId());
   ui.isPaused = false;
+  ui.highScoreSaved = false;
   clearHeldKeys();
 }
 
