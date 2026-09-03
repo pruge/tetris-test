@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tetris — Phase 0</title>
+<title>Tetris — Phase 1</title>
 <style>
   :root {
     --color-bg: #16181c;
@@ -58,6 +58,20 @@ const CONFIG = {
   MAX_FRAME_MS: 250,        // 탭 복귀 등으로 델타가 튀는 것을 막는 상한
   SPAWN_X: 3,
   SPAWN_Y: 0,
+  DAS_MS: 167,              // 좌우 키를 누른 뒤 자동 반복이 시작되기까지의 지연
+  ARR_MS: 33,               // 자동 반복 간격
+  SOFT_DROP_DIVISOR: 20,    // 소프트 드롭 중 낙하 간격 = DROP_INTERVAL_MS / 이 값
+  ROTATION_STATES: 4,
+  KEYS: {
+    LEFT: 'ArrowLeft',
+    RIGHT: 'ArrowRight',
+    SOFT_DROP: 'ArrowDown',
+    HARD_DROP: ' ',
+    ROTATE_CW: ['ArrowUp', 'x', 'X'],
+    ROTATE_CCW: ['z', 'Z'],
+  },
+  ROTATE_CW_DIR: 1,
+  ROTATE_CCW_DIR: -1,
   COLORS: {
     GRID: '#2a2e37',
     1: '#48c9d8', // I
@@ -165,6 +179,18 @@ function movedDown(piece) {
   return { ...piece, y: piece.y + 1 };
 }
 
+/** (dx, dy) 만큼 옮긴 새 조각. 인자 piece 는 변형하지 않는다. */
+function movedBy(piece, dx, dy) {
+  return { ...piece, x: piece.x + dx, y: piece.y + dy };
+}
+
+/** dir(+1 시계 / -1 반시계) 만큼 회전한 새 조각. 인자 piece 는 변형하지 않는다.
+ *  모양은 CONFIG.SHAPES 테이블 조회로만 바뀌므로 조각별 분기가 없다. */
+function rotated(piece, dir) {
+  const states = CONFIG.ROTATION_STATES;
+  return { ...piece, rot: (piece.rot + dir + states) % states };
+}
+
 function spawnPiece(id) {
   return { id, rot: 0, x: CONFIG.SPAWN_X, y: CONFIG.SPAWN_Y };
 }
@@ -182,6 +208,7 @@ const state = {
   dropAccumulatorMs: 0,
   isOver: false,
   lockedCount: 0,
+  isSoftDropping: false,
 };
 
 /* ============================================================
@@ -249,20 +276,124 @@ function render(currentState) {
 }
 
 /* ============================================================
- * INPUT — T-002. 이 태스크에서는 입력을 받지 않는다.
+ * INPUT — 키 이벤트를 의도 객체로만 바꾼다. 규칙은 실행하지 않는다.
+ *   { type: 'move', dx }, { type: 'rotate', dir },
+ *   { type: 'softDrop', active }, { type: 'hardDrop' }
+ * 의도를 LOGIC 에 적용하는 것은 LOOP 의 advance() 책임이다.
  * ============================================================ */
+const input = {
+  intents: [],
+  heldDx: 0,          // 0 이면 좌우 키를 누르고 있지 않음
+  repeatTimerMs: 0,
+  isDasCharged: false,
+};
+
+function pushIntent(intent) {
+  input.intents.push(intent);
+}
+
+/** 큐를 비우고 쌓인 의도를 넘긴다. */
+function takeIntents() {
+  const taken = input.intents;
+  input.intents = [];
+  return taken;
+}
+
+/** 좌우 키를 누르고 있는 동안 DAS 후 ARR 간격으로 move 의도를 만든다. */
+function updateAutoRepeat(deltaMs) {
+  if (input.heldDx === 0) return;
+  input.repeatTimerMs += deltaMs;
+  while (true) {
+    const thresholdMs = input.isDasCharged ? CONFIG.ARR_MS : CONFIG.DAS_MS;
+    if (input.repeatTimerMs < thresholdMs) break;
+    input.repeatTimerMs -= thresholdMs;
+    input.isDasCharged = true;
+    pushIntent({ type: 'move', dx: input.heldDx });
+    if (thresholdMs <= 0) break;   // ARR 0 에서 무한 루프 방지
+  }
+}
+
+function startHorizontalHold(dx) {
+  if (input.heldDx === dx) return;
+  input.heldDx = dx;
+  input.repeatTimerMs = 0;
+  input.isDasCharged = false;
+  pushIntent({ type: 'move', dx });
+}
+
+function stopHorizontalHold(dx) {
+  if (input.heldDx !== dx) return;
+  input.heldDx = 0;
+  input.repeatTimerMs = 0;
+  input.isDasCharged = false;
+}
+
+function keyToDx(key) {
+  if (key === CONFIG.KEYS.LEFT) return -1;
+  if (key === CONFIG.KEYS.RIGHT) return 1;
+  return 0;
+}
+
+function keyToRotationDir(key) {
+  if (CONFIG.KEYS.ROTATE_CW.includes(key)) return CONFIG.ROTATE_CW_DIR;
+  if (CONFIG.KEYS.ROTATE_CCW.includes(key)) return CONFIG.ROTATE_CCW_DIR;
+  return 0;
+}
+
+function isBoundKey(key) {
+  return keyToDx(key) !== 0
+    || keyToRotationDir(key) !== 0
+    || key === CONFIG.KEYS.SOFT_DROP
+    || key === CONFIG.KEYS.HARD_DROP;
+}
+
+function handleKeyDown(event) {
+  const key = event.key;
+  if (!isBoundKey(key)) return;
+  event.preventDefault();
+  if (event.repeat) return;   // 자동 반복은 DAS/ARR 이 담당한다
+
+  const dx = keyToDx(key);
+  if (dx !== 0) {
+    startHorizontalHold(dx);
+    return;
+  }
+  const dir = keyToRotationDir(key);
+  if (dir !== 0) {
+    pushIntent({ type: 'rotate', dir });
+    return;
+  }
+  if (key === CONFIG.KEYS.SOFT_DROP) {
+    pushIntent({ type: 'softDrop', active: true });
+    return;
+  }
+  pushIntent({ type: 'hardDrop' });
+}
+
+function handleKeyUp(event) {
+  const key = event.key;
+  if (!isBoundKey(key)) return;
+  event.preventDefault();
+
+  const dx = keyToDx(key);
+  if (dx !== 0) {
+    stopHorizontalHold(dx);
+    return;
+  }
+  if (key === CONFIG.KEYS.SOFT_DROP) {
+    pushIntent({ type: 'softDrop', active: false });
+  }
+}
+
+window.addEventListener('keydown', handleKeyDown);
+window.addEventListener('keyup', handleKeyUp);
 
 /* ============================================================
  * LOOP — 델타 타임 누적. 프레임레이트와 무관하게 낙하 간격이 같다.
  * ============================================================ */
 
-/** 낙하 1회. 고정 가능하면 고정하고 다음 조각을 스폰한다. */
-function stepDown() {
-  const next = movedDown(state.piece);
-  if (!collides(state.board, next)) {
-    state.piece = next;
-    return;
-  }
+/** 현재 조각을 고정하고 다음 조각을 스폰한다. */
+function lockAndSpawn() {
   state.board = lockPiece(state.board, state.piece);
   state.lockedCount++;
   const spawned = spawnPiece(randomPieceId());
@@ -274,10 +405,64 @@ function stepDown() {
   state.piece = spawned;
 }
 
+/** 낙하 1회. 고정 가능하면 고정하고 다음 조각을 스폰한다. */
+function stepDown() {
+  const next = movedDown(state.piece);
+  if (!collides(state.board, next)) {
+    state.piece = next;
+    return;
+  }
+  lockAndSpawn();
+}
+
+/** 겹치지 않을 때만 조각을 교체한다. 겹치면 no-op (월킥은 T-003). */
+function tryReplacePiece(candidate) {
+  if (collides(state.board, candidate)) return;
+  state.piece = candidate;
+}
+
+/** 더 못 내려갈 때까지 내린 뒤 같은 프레임에 고정한다. */
+function hardDrop() {
+  let landed = state.piece;
+  while (!collides(state.board, movedDown(landed))) {
+    landed = movedDown(landed);
+  }
+  state.piece = landed;
+  lockAndSpawn();
+  state.dropAccumulatorMs = 0;
+}
+
+function applyIntent(intent) {
+  if (state.isOver) return;
+  if (intent.type === 'move') {
+    tryReplacePiece(movedBy(state.piece, intent.dx, 0));
+    return;
+  }
+  if (intent.type === 'rotate') {
+    tryReplacePiece(rotated(state.piece, intent.dir));
+    return;
+  }
+  if (intent.type === 'softDrop') {
+    state.isSoftDropping = intent.active;
+    return;
+  }
+  if (intent.type === 'hardDrop') hardDrop();
+}
+
+/** 소프트 드롭 중이면 낙하 간격을 SOFT_DROP_DIVISOR 로 나눈다. */
+function dropIntervalMs() {
+  return state.isSoftDropping
+    ? CONFIG.DROP_INTERVAL_MS / CONFIG.SOFT_DROP_DIVISOR
+    : CONFIG.DROP_INTERVAL_MS;
+}
+
 function advance(deltaMs) {
+  updateAutoRepeat(deltaMs);
+  for (const intent of takeIntents()) applyIntent(intent);
+
   state.dropAccumulatorMs += deltaMs;
-  while (state.dropAccumulatorMs >= CONFIG.DROP_INTERVAL_MS && !state.isOver) {
-    state.dropAccumulatorMs -= CONFIG.DROP_INTERVAL_MS;
+  while (state.dropAccumulatorMs >= dropIntervalMs() && !state.isOver) {
+    state.dropAccumulatorMs -= dropIntervalMs();
     stepDown();
   }
 }
