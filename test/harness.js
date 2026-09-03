@@ -34,6 +34,7 @@ const EXPORTED_SYMBOLS = [
   // INPUT
   'pushIntent', 'takeIntents', 'updateAutoRepeat', 'startHorizontalHold',
   'stopHorizontalHold', 'clearHeldKeys', 'handleKeyDown', 'handleKeyUp',
+  'handleTouchStart', 'handleTouchMove', 'handleTouchEnd',
   // LOOP
   'isPieceLanded', 'clearLockTimer', 'noteLockReset', 'applyLineClears',
   'lockAndSpawn', 'stepDown', 'updateLockTimer', 'hardDrop', 'holdCurrentPiece',
@@ -74,6 +75,22 @@ function makeRandom(seed) {
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * 테스트가 명시적으로 밀어 올리는 시계. 실제 시간은 흐르지 않는다.
+ *
+ * 게임의 `performance.now()` 가 이 값을 읽는다. 시작값 0 에서 아무도 밀지
+ * 않으면 계속 0 이라, 시계를 쓰지 않는 테스트에는 기존 스텁과 구별되지 않는다.
+ * `advance(deltaMs)` 가 델타를 받는 것은 게임의 `advance(deltaMs)` 와 같은 규약이다.
+ */
+function makeClock(startMs = 0) {
+  let nowMs = startMs;
+  return {
+    now: () => nowMs,
+    advance(deltaMs) { nowMs += deltaMs; return nowMs; },
+    set(ms) { nowMs = ms; return nowMs; },
   };
 }
 
@@ -154,9 +171,11 @@ function makeThrowingLocalStorage() {
  * options.random          시드 대신 쓸 난수 함수
  * options.storage         localStorage 초기 내용 { key: value }
  * options.localStorage    localStorage 스텁 자체를 교체 (예외 주입용)
+ * options.clock           performance.now() 가 읽을 시계 (기본 makeClock() — 0 에서 정지)
  */
 function loadGame(options = {}) {
   const logs = [];
+  const clock = options.clock || makeClock();
   const documentStub = makeDocument();
   const localStorage = options.localStorage || makeLocalStorage(options.storage);
   const windowStub = {
@@ -181,7 +200,9 @@ function loadGame(options = {}) {
   const factory = new Function(
     'window', 'document', 'localStorage', 'getComputedStyle',
     'requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'console', 'Math',
-    `${gameSource()}\n;return { ${EXPORTED_SYMBOLS.join(', ')} };`
+    // performance 는 게임의 최상위 선언이 아니라 하네스가 주입한 바인딩이다.
+    // 게임이 실제로 어느 시계를 보는지 테스트가 확인할 수 있게 함께 꺼낸다.
+    `${gameSource()}\n;return { ${EXPORTED_SYMBOLS.join(', ')}, performance };`
   );
 
   const symbols = factory(
@@ -191,12 +212,15 @@ function loadGame(options = {}) {
     () => ({ getPropertyValue: () => '#000000' }),
     requestAnimationFrame,
     () => {},
-    { now: () => 0 },
+    { now: () => clock.now() },
     consoleStub,
     mathStub
   );
 
-  return { ...symbols, harness: { logs, localStorage, document: documentStub, rafCallbacks } };
+  return {
+    ...symbols,
+    harness: { logs, localStorage, document: documentStub, rafCallbacks, clock },
+  };
 }
 
 /* ---- 테스트 픽스처 헬퍼. 프로덕션 함수가 아니다. ---- */
@@ -221,6 +245,7 @@ module.exports = {
   makeLocalStorage,
   makeThrowingLocalStorage,
   makeRandom,
+  makeClock,
   extractScript,
   fillRow,
   setCells,
