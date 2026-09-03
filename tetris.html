@@ -54,8 +54,21 @@ const CONFIG = {
   GRID_LINE_PX: 1,
   BLOCK_INSET_PX: 1,
   EMPTY: 0,
-  DROP_INTERVAL_MS: 1000,   // 고정 낙하 간격
   MAX_FRAME_MS: 250,        // 탭 복귀 등으로 델타가 튀는 것을 막는 상한
+  LOCK_DELAY_MS: 500,       // 바닥에 닿은 뒤 고정까지의 유예
+  LOCK_RESET_LIMIT: 15,     // 조각당 유예 리셋 상한. 없으면 무한 스핀
+  LINES_PER_LEVEL: 10,      // 이만큼 지울 때마다 레벨 +1
+  START_LEVEL: 1,
+  LINE_SCORES: { 1: 100, 2: 300, 3: 500, 4: 800 },  // × 현재 레벨
+  SOFT_DROP_POINTS_PER_CELL: 1,
+  HARD_DROP_POINTS_PER_CELL: 2,
+  // 레벨별 낙하 간격(ms). 프레임 수가 아니라 ms 로 둬야 rAF 주기와 무관하다.
+  // 표에 없는 레벨은 마지막 값을 쓴다.
+  LEVEL_INTERVALS_MS: {
+    1: 1000, 2: 793, 3: 618, 4: 473, 5: 355,
+    6: 262, 7: 190, 8: 135, 9: 94, 10: 64,
+    11: 43, 12: 28, 13: 18, 14: 11, 15: 7,
+  },
   SPAWN_X: 3,
   SPAWN_Y: 0,
   DAS_MS: 167,              // 좌우 키를 누른 뒤 자동 반복이 시작되기까지의 지연
@@ -177,6 +190,7 @@ const CONFIG = {
 
 const PIECE_IDS = Object.keys(CONFIG.SHAPES).map(Number);
 const VISIBLE_ROWS = CONFIG.ROWS - CONFIG.BUFFER_ROWS;
+const MAX_LEVEL = Math.max(...Object.keys(CONFIG.LEVEL_INTERVALS_MS).map(Number));
 
 /* ============================================================
  * LOGIC — 순수 함수. canvas 도, 시간도, DOM 도 모른다.
@@ -217,6 +231,57 @@ function lockPiece(board, piece) {
     }
   }
   return next;
+}
+
+/** 그 행의 모든 셀이 차 있는가. board 를 읽기만 한다. */
+function isRowFull(board, row) {
+  for (let col = 0; col < CONFIG.COLS; col++) {
+    if (board[cellIndex(col, row)] === CONFIG.EMPTY) return false;
+  }
+  return true;
+}
+
+/** 가득 찬 행을 지우고 위 행들을 내린 새 보드를 반환한다.
+ *  인자 board 는 변형하지 않는다. 버퍼 행도 대상이다.
+ *  -> { board: 새 보드, clearedRows: 지워진 행 번호(아래에서 위 순서) } */
+function clearLines(board) {
+  const next = board.slice();
+  const clearedRows = [];
+  let writeRow = CONFIG.ROWS - 1;
+  for (let row = CONFIG.ROWS - 1; row >= 0; row--) {
+    if (isRowFull(board, row)) {
+      clearedRows.push(row);
+      continue;
+    }
+    for (let col = 0; col < CONFIG.COLS; col++) {
+      next[cellIndex(col, writeRow)] = board[cellIndex(col, row)];
+    }
+    writeRow--;
+  }
+  for (let row = writeRow; row >= 0; row--) {
+    for (let col = 0; col < CONFIG.COLS; col++) {
+      next[cellIndex(col, row)] = CONFIG.EMPTY;
+    }
+  }
+  return { board: next, clearedRows };
+}
+
+/** 지운 줄 수와 현재 레벨로 얻는 점수. 표에 없는 줄 수는 0점. */
+function lineClearScore(clearedCount, level) {
+  const base = CONFIG.LINE_SCORES[clearedCount];
+  return base === undefined ? 0 : base * level;
+}
+
+/** 누적 클리어 줄 수 -> 레벨. LINES_PER_LEVEL 줄마다 +1. */
+function levelForClearedLines(clearedLines) {
+  const gained = Math.floor(clearedLines / CONFIG.LINES_PER_LEVEL);
+  return CONFIG.START_LEVEL + gained;
+}
+
+/** 레벨 -> 낙하 간격(ms). 표 밖의 레벨은 마지막 값으로 고정한다. */
+function levelIntervalMs(level) {
+  const clamped = Math.min(Math.max(level, CONFIG.START_LEVEL), MAX_LEVEL);
+  return CONFIG.LEVEL_INTERVALS_MS[clamped];
 }
 
 /** 한 칸 내려간 새 조각. 인자 piece 는 변형하지 않는다. */
@@ -282,6 +347,11 @@ const state = {
   dropAccumulatorMs: 0,
   isOver: false,
   lockedCount: 0,
+  lockTimerMs: null,    // null = 접지하지 않음. 접지 중이면 누적 유예 시간(ms)
+  lockResetCount: 0,    // 현재 조각이 유예를 리셋한 횟수. LOCK_RESET_LIMIT 까지
+  score: 0,
+  clearedLines: 0,
+  level: CONFIG.START_LEVEL,
   isSoftDropping: false,
 };
 
@@ -494,10 +564,42 @@ window.addEventListener('keyup', handleKeyUp);
  * LOOP — 델타 타임 누적. 프레임레이트와 무관하게 낙하 간격이 같다.
  * ============================================================ */
 
-/** 현재 조각을 고정하고 다음 조각을 스폰한다. */
+/** 현재 조각이 한 칸도 못 내려가는 상태인가(= 접지). */
+function isPieceLanded() {
+  return collides(state.board, movedDown(state.piece));
+}
+
+/** 유예 타이머를 해제한다. 새 조각 스폰과 공중 복귀가 쓴다. */
+function clearLockTimer() {
+  state.lockTimerMs = null;
+  state.lockResetCount = 0;
+}
+
+/** 이동·회전이 실제로 성공했을 때의 유예 리셋.
+ *  접지 중이 아니면 아무 일도 없고, 상한에 도달했으면 더 리셋하지 않는다. */
+function noteLockReset() {
+  if (state.lockTimerMs === null) return;
+  if (state.lockResetCount >= CONFIG.LOCK_RESET_LIMIT) return;
+  state.lockResetCount++;
+  state.lockTimerMs = 0;
+}
+
+/** 지운 줄 수를 점수·누적 줄 수·레벨에 반영한다. 점수는 레벨업 전 레벨 기준. */
+function applyLineClears(clearedCount) {
+  if (clearedCount === 0) return;
+  state.score += lineClearScore(clearedCount, state.level);
+  state.clearedLines += clearedCount;
+  state.level = levelForClearedLines(state.clearedLines);
+}
+
+/** 현재 조각을 고정하고, 줄을 지우고, 다음 조각을 스폰한다. */
 function lockAndSpawn() {
-  state.board = lockPiece(state.board, state.piece);
+  const locked = lockPiece(state.board, state.piece);
+  const cleared = clearLines(locked);
+  state.board = cleared.board;
   state.lockedCount++;
+  applyLineClears(cleared.clearedRows.length);
+  clearLockTimer();
   const spawned = spawnPiece(takeQueuedPieceId());
   if (collides(state.board, spawned)) {
     state.isOver = true;
@@ -507,29 +609,43 @@ function lockAndSpawn() {
   state.piece = spawned;
 }
 
-/** 낙하 1회. 고정 가능하면 고정하고 다음 조각을 스폰한다. */
+/** 낙하 1회. 내려갈 수 없으면 고정하지 않는다 — 유예는 updateLockTimer 가 센다. */
 function stepDown() {
   const next = movedDown(state.piece);
-  if (!collides(state.board, next)) {
-    state.piece = next;
+  if (collides(state.board, next)) return;
+  state.piece = next;
+  if (state.isSoftDropping) state.score += CONFIG.SOFT_DROP_POINTS_PER_CELL;
+}
+
+/** 접지 상태면 유예를 누적하고, LOCK_DELAY_MS 를 넘기면 고정한다.
+ *  다시 내려갈 수 있게 되면 타이머를 해제한다. 시간을 아는 것은 LOOP 뿐이다. */
+function updateLockTimer(deltaMs) {
+  if (state.isOver) return;
+  if (!isPieceLanded()) {
+    if (state.lockTimerMs !== null) clearLockTimer();
     return;
   }
-  lockAndSpawn();
+  state.lockTimerMs = (state.lockTimerMs === null ? 0 : state.lockTimerMs) + deltaMs;
+  if (state.lockTimerMs >= CONFIG.LOCK_DELAY_MS) lockAndSpawn();
 }
 
-/** 겹치지 않을 때만 조각을 교체한다. 겹치면 no-op. 이동 경로가 쓴다. */
+/** 겹치지 않을 때만 조각을 교체한다. 교체했으면 true. 이동 경로가 쓴다. */
 function tryReplacePiece(candidate) {
-  if (collides(state.board, candidate)) return;
+  if (collides(state.board, candidate)) return false;
   state.piece = candidate;
+  return true;
 }
 
-/** 더 못 내려갈 때까지 내린 뒤 같은 프레임에 고정한다. */
+/** 더 못 내려갈 때까지 내린 뒤 유예 없이 같은 프레임에 고정한다. */
 function hardDrop() {
   let landed = state.piece;
+  let cells = 0;
   while (!collides(state.board, movedDown(landed))) {
     landed = movedDown(landed);
+    cells++;
   }
   state.piece = landed;
+  state.score += cells * CONFIG.HARD_DROP_POINTS_PER_CELL;
   lockAndSpawn();
   state.dropAccumulatorMs = 0;
 }
@@ -537,12 +653,14 @@ function hardDrop() {
 function applyIntent(intent) {
   if (state.isOver) return;
   if (intent.type === 'move') {
-    tryReplacePiece(movedBy(state.piece, intent.dx, 0));
+    if (tryReplacePiece(movedBy(state.piece, intent.dx, 0))) noteLockReset();
     return;
   }
   if (intent.type === 'rotate') {
     const rotatedPiece = tryRotate(state.board, state.piece, intent.dir);
-    if (rotatedPiece !== null) state.piece = rotatedPiece;
+    if (rotatedPiece === null) return;
+    state.piece = rotatedPiece;
+    noteLockReset();
     return;
   }
   if (intent.type === 'softDrop') {
@@ -552,11 +670,10 @@ function applyIntent(intent) {
   if (intent.type === 'hardDrop') hardDrop();
 }
 
-/** 소프트 드롭 중이면 낙하 간격을 SOFT_DROP_DIVISOR 로 나눈다. */
+/** 레벨별 낙하 간격. 소프트 드롭 중이면 SOFT_DROP_DIVISOR 로 나눈다. */
 function dropIntervalMs() {
-  return state.isSoftDropping
-    ? CONFIG.DROP_INTERVAL_MS / CONFIG.SOFT_DROP_DIVISOR
-    : CONFIG.DROP_INTERVAL_MS;
+  const base = levelIntervalMs(state.level);
+  return state.isSoftDropping ? base / CONFIG.SOFT_DROP_DIVISOR : base;
 }
 
 function advance(deltaMs) {
@@ -568,6 +685,7 @@ function advance(deltaMs) {
     state.dropAccumulatorMs -= dropIntervalMs();
     stepDown();
   }
+  updateLockTimer(deltaMs);
 }
 
 let lastFrameMs = null;
