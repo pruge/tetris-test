@@ -12,6 +12,7 @@
     --color-border: #3a404b;
     --color-text: #c8ccd4;
     --space-frame: 16px;
+    --space-gap: 12px;
     --radius-frame: 4px;
     --font-ui: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
@@ -30,7 +31,12 @@
   main {
     padding: var(--space-frame);
   }
-  #board {
+  .playfield {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-gap);
+  }
+  #board, .side {
     display: block;
     background: var(--color-panel);
     border: 1px solid var(--color-border);
@@ -40,7 +46,11 @@
 </head>
 <body>
 <main>
-  <canvas id="board"></canvas>
+  <div class="playfield">
+    <canvas id="hold" class="side"></canvas>
+    <canvas id="board"></canvas>
+    <canvas id="preview" class="side"></canvas>
+  </div>
 </main>
 <script>
 /* ============================================================
@@ -69,12 +79,19 @@ const CONFIG = {
     HARD_DROP: ' ',
     ROTATE_CW: ['ArrowUp', 'x', 'X'],
     ROTATE_CCW: ['z', 'Z'],
+    HOLD: ['c', 'C', 'Shift'],
   },
   ROTATE_CW_DIR: 1,
   ROTATE_CCW_DIR: -1,
   BAG_SIZE: 7,              // 7-bag: 한 bag 에 7종이 정확히 한 번씩
   QUEUE_SIZE: 5,            // 다음 조각 큐를 항상 이 길이 이상으로 유지한다
   I_PIECE_ID: 1,            // I 만 월킥 오프셋 표가 다르다
+  GHOST_ALPHA: 0.28,        // 고스트(착지 예상 위치) 투명도
+  PREVIEW_COUNT: 5,         // 보드 오른쪽에 그릴 다음 조각 수
+  PREVIEW_CELL_PX: 18,      // 미리보기·홀드 슬롯의 셀 크기
+  PREVIEW_SLOT_COLS: 4,     // 조각 모양이 들어가는 슬롯 폭(셀)
+  PREVIEW_SLOT_ROWS: 3,     // 슬롯 높이(셀). 모양 2행 + 여백 1행
+  HOLD_SLOT_COUNT: 1,       // 홀드 슬롯은 항상 1칸
   // SRS 월킥 오프셋: [from][to] -> [dx, dy] 5개를 순서대로 시도한다.
   // 첫 오프셋은 항상 [0,0] (밀지 않고 그대로 되는 경우).
   // 주의: 표준 SRS 표는 y 가 위로 증가한다. 이 코드의 y 는 아래로 증가하므로
@@ -259,6 +276,16 @@ function tryRotate(board, piece, dir) {
   return null;
 }
 
+/** 조각이 하드 드롭될 위치의 새 piece. board 와 piece 를 변형하지 않는다.
+ *  반환값에서 한 칸 더 내려가면 반드시 collides 가 true 다. */
+function dropPosition(board, piece) {
+  let landed = movedBy(piece, 0, 0);
+  while (!collides(board, movedDown(landed))) {
+    landed = movedDown(landed);
+  }
+  return landed;
+}
+
 /** 새 배열을 셔플해 반환한다. 인자를 변형하지 않는다. */
 function shuffled(items) {
   const next = items.slice();
@@ -283,6 +310,8 @@ const state = {
   isOver: false,
   lockedCount: 0,
   isSoftDropping: false,
+  hold: null,           // 보관 중인 조각 id. null 이면 보관함이 비어 있다
+  canHold: true,        // 조각 하나가 고정될 때까지 홀드는 1회만
 };
 
 /** 7-bag 에서 다음 조각 id 하나를 뽑는다. bag 이 비면 새로 셔플해 채운다. */
@@ -321,10 +350,26 @@ const ctx = canvas.getContext('2d');
 canvas.width = CONFIG.COLS * CONFIG.CELL_PX;
 canvas.height = VISIBLE_ROWS * CONFIG.CELL_PX;
 
-/** 보드 행 -> 화면 y 픽셀. 버퍼 행은 음수가 되어 화면 밖으로 나간다. */
-function screenY(row) {
-  return (row - CONFIG.BUFFER_ROWS) * CONFIG.CELL_PX;
-}
+const holdCanvas = document.getElementById('hold');
+const holdCtx = holdCanvas.getContext('2d');
+const previewCanvas = document.getElementById('preview');
+const previewCtx = previewCanvas.getContext('2d');
+const SLOT_WIDTH_PX = CONFIG.PREVIEW_SLOT_COLS * CONFIG.PREVIEW_CELL_PX;
+const SLOT_HEIGHT_PX = CONFIG.PREVIEW_SLOT_ROWS * CONFIG.PREVIEW_CELL_PX;
+holdCanvas.width = SLOT_WIDTH_PX;
+holdCanvas.height = CONFIG.HOLD_SLOT_COUNT * SLOT_HEIGHT_PX;
+previewCanvas.width = SLOT_WIDTH_PX;
+previewCanvas.height = CONFIG.PREVIEW_COUNT * SLOT_HEIGHT_PX;
+
+/** 그리기 대상: 어느 ctx 에 어떤 셀 크기로, 어느 행을 화면 0 으로 볼 것인가.
+ *  offsetRows 만큼 위로 밀어 그린다. 버퍼 행은 음수 y 가 되어 화면 밖으로 나간다. */
+const BOARD_TARGET = {
+  ctx,
+  cellPx: CONFIG.CELL_PX,
+  offsetRows: CONFIG.BUFFER_ROWS,
+  alpha: 1,
+};
+const GHOST_TARGET = { ...BOARD_TARGET, alpha: CONFIG.GHOST_ALPHA };
 
 function drawGrid() {
   ctx.strokeStyle = CONFIG.COLORS.GRID;
@@ -346,17 +391,21 @@ function drawGrid() {
   }
 }
 
-function drawCell(col, row, pieceId) {
-  const y = screenY(row);
-  if (y + CONFIG.CELL_PX <= 0) return;
+function drawCell(col, row, pieceId, target = BOARD_TARGET) {
+  const y = (row - target.offsetRows) * target.cellPx;
+  if (y + target.cellPx <= 0) return;
   const inset = CONFIG.BLOCK_INSET_PX;
-  ctx.fillStyle = CONFIG.COLORS[pieceId];
-  ctx.fillRect(
-    col * CONFIG.CELL_PX + inset,
+  const g = target.ctx;
+  g.save();
+  g.globalAlpha = target.alpha;
+  g.fillStyle = CONFIG.COLORS[pieceId];
+  g.fillRect(
+    col * target.cellPx + inset,
     y + inset,
-    CONFIG.CELL_PX - inset * 2,
-    CONFIG.CELL_PX - inset * 2
+    target.cellPx - inset * 2,
+    target.cellPx - inset * 2
   );
+  g.restore();
 }
 
 function drawBoard(board) {
@@ -368,19 +417,49 @@ function drawBoard(board) {
   }
 }
 
+/** 슬롯 하나에 회전 0 모양을 그린다. 슬롯 인덱스만큼 아래로 내려간다. */
+function drawSlotPiece(slotCtx, pieceId, slotIndex) {
+  const target = {
+    ctx: slotCtx,
+    cellPx: CONFIG.PREVIEW_CELL_PX,
+    offsetRows: -slotIndex * CONFIG.PREVIEW_SLOT_ROWS,
+    alpha: 1,
+  };
+  for (const [col, row] of pieceCells(spawnPiece(pieceId))) {
+    drawCell(col - CONFIG.SPAWN_X, row, pieceId, target);
+  }
+}
+
+/** 홀드(왼쪽 1칸)와 다음 조각 미리보기(오른쪽 PREVIEW_COUNT 칸)를 그린다. */
+function renderSidePanels(currentState) {
+  holdCtx.clearRect(0, 0, holdCanvas.width, holdCanvas.height);
+  if (currentState.hold !== null) drawSlotPiece(holdCtx, currentState.hold, 0);
+
+  previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+  const upcoming = currentState.queue.slice(0, CONFIG.PREVIEW_COUNT);
+  upcoming.forEach((pieceId, slotIndex) => {
+    drawSlotPiece(previewCtx, pieceId, slotIndex);
+  });
+}
+
 function render(currentState) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawGrid();
   drawBoard(currentState.board);
+  const ghost = dropPosition(currentState.board, currentState.piece);
+  for (const [col, row] of pieceCells(ghost)) {
+    drawCell(col, row, ghost.id, GHOST_TARGET);
+  }
   for (const [col, row] of pieceCells(currentState.piece)) {
     drawCell(col, row, currentState.piece.id);
   }
+  renderSidePanels(currentState);
 }
 
 /* ============================================================
  * INPUT — 키 이벤트를 의도 객체로만 바꾼다. 규칙은 실행하지 않는다.
  *   { type: 'move', dx }, { type: 'rotate', dir },
- *   { type: 'softDrop', active }, { type: 'hardDrop' }
+ *   { type: 'softDrop', active }, { type: 'hardDrop' }, { type: 'hold' }
  * 의도를 LOGIC 에 적용하는 것은 LOOP 의 advance() 책임이다.
  * ============================================================ */
 const input = {
@@ -442,9 +521,14 @@ function keyToRotationDir(key) {
   return 0;
 }
 
+function isHoldKey(key) {
+  return CONFIG.KEYS.HOLD.includes(key);
+}
+
 function isBoundKey(key) {
   return keyToDx(key) !== 0
     || keyToRotationDir(key) !== 0
+    || isHoldKey(key)
     || key === CONFIG.KEYS.SOFT_DROP
     || key === CONFIG.KEYS.HARD_DROP;
 }
@@ -463,6 +547,10 @@ function handleKeyDown(event) {
   const dir = keyToRotationDir(key);
   if (dir !== 0) {
     pushIntent({ type: 'rotate', dir });
+    return;
+  }
+  if (isHoldKey(key)) {
+    pushIntent({ type: 'hold' });
     return;
   }
   if (key === CONFIG.KEYS.SOFT_DROP) {
@@ -505,6 +593,7 @@ function lockAndSpawn() {
     return;
   }
   state.piece = spawned;
+  state.canHold = true;
 }
 
 /** 낙하 1회. 고정 가능하면 고정하고 다음 조각을 스폰한다. */
@@ -534,6 +623,17 @@ function hardDrop() {
   state.dropAccumulatorMs = 0;
 }
 
+/** 현재 조각을 보관함과 맞바꾼다. 보관함이 비어 있으면 큐에서 꺼낸다.
+ *  나온 조각은 rot 0, 스폰 좌표로 초기화된다. 조각당 1회만 허용한다. */
+function holdCurrentPiece() {
+  if (!state.canHold) return;
+  const storedId = state.hold;
+  state.hold = state.piece.id;
+  state.piece = spawnPiece(storedId === null ? takeQueuedPieceId() : storedId);
+  state.canHold = false;
+  state.dropAccumulatorMs = 0;
+}
+
 function applyIntent(intent) {
   if (state.isOver) return;
   if (intent.type === 'move') {
@@ -547,6 +647,10 @@ function applyIntent(intent) {
   }
   if (intent.type === 'softDrop') {
     state.isSoftDropping = intent.active;
+    return;
+  }
+  if (intent.type === 'hold') {
+    holdCurrentPiece();
     return;
   }
   if (intent.type === 'hardDrop') hardDrop();
