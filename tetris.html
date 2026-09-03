@@ -1650,6 +1650,9 @@ function resetGame() {
   state.isSoftDropping = false;
   state.hold = null;
   state.canHold = true;
+  state.combo = CONFIG.NO_COMBO;
+  state.isBackToBack = false;
+  state.lastMoveWasRotation = false;
   state.piece = spawnPiece(takeQueuedPieceId());
   ui.isPaused = false;
   ui.highScoreSaved = false;
