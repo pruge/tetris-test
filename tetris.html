@@ -72,6 +72,51 @@ const CONFIG = {
   },
   ROTATE_CW_DIR: 1,
   ROTATE_CCW_DIR: -1,
+  BAG_SIZE: 7,              // 7-bag: 한 bag 에 7종이 정확히 한 번씩
+  QUEUE_SIZE: 5,            // 다음 조각 큐를 항상 이 길이 이상으로 유지한다
+  I_PIECE_ID: 1,            // I 만 월킥 오프셋 표가 다르다
+  // SRS 월킥 오프셋: [from][to] -> [dx, dy] 5개를 순서대로 시도한다.
+  // 첫 오프셋은 항상 [0,0] (밀지 않고 그대로 되는 경우).
+  // 주의: 표준 SRS 표는 y 가 위로 증가한다. 이 코드의 y 는 아래로 증가하므로
+  // dy 부호를 전부 뒤집어 옮겼다. 예) 표준 0->R 의 (0,-2)(아래 2칸)는 여기서 [0, 2].
+  KICKS: {
+    JLSTZ: {
+      0: {
+        1: [[0,0], [-1,0], [-1,-1], [0,2], [-1,2]],
+        3: [[0,0], [1,0], [1,-1], [0,2], [1,2]],
+      },
+      1: {
+        0: [[0,0], [1,0], [1,1], [0,-2], [1,-2]],
+        2: [[0,0], [1,0], [1,1], [0,-2], [1,-2]],
+      },
+      2: {
+        1: [[0,0], [-1,0], [-1,-1], [0,2], [-1,2]],
+        3: [[0,0], [1,0], [1,-1], [0,2], [1,2]],
+      },
+      3: {
+        2: [[0,0], [-1,0], [-1,1], [0,-2], [-1,-2]],
+        0: [[0,0], [-1,0], [-1,1], [0,-2], [-1,-2]],
+      },
+    },
+    I: {
+      0: {
+        1: [[0,0], [-2,0], [1,0], [-2,1], [1,-2]],
+        3: [[0,0], [-1,0], [2,0], [-1,-2], [2,1]],
+      },
+      1: {
+        0: [[0,0], [2,0], [-1,0], [2,-1], [-1,2]],
+        2: [[0,0], [-1,0], [2,0], [-1,-2], [2,1]],
+      },
+      2: {
+        1: [[0,0], [1,0], [-2,0], [1,2], [-2,-1]],
+        3: [[0,0], [2,0], [-1,0], [2,-1], [-1,2]],
+      },
+      3: {
+        2: [[0,0], [-2,0], [1,0], [-2,1], [1,-2]],
+        0: [[0,0], [1,0], [-2,0], [1,2], [-2,-1]],
+      },
+    },
+  },
   COLORS: {
     GRID: '#2a2e37',
     1: '#48c9d8', // I
@@ -195,21 +240,78 @@ function spawnPiece(id) {
   return { id, rot: 0, x: CONFIG.SPAWN_X, y: CONFIG.SPAWN_Y };
 }
 
-function randomPieceId() {
-  return PIECE_IDS[Math.floor(Math.random() * PIECE_IDS.length)];
+/** 조각 id 에 맞는 월킥 표. I 만 오프셋이 다르고 나머지는 공용이다. */
+function kickOffsets(pieceId, fromRot, toRot) {
+  const table = pieceId === CONFIG.I_PIECE_ID ? CONFIG.KICKS.I : CONFIG.KICKS.JLSTZ;
+  return table[fromRot] && table[fromRot][toRot];
+}
+
+/** 월킥을 적용한 회전. 성공하면 새 piece, 5개 오프셋이 모두 막히면 null.
+ *  board 와 piece 를 변형하지 않는다. 실패는 예외가 아니라 null 이다. */
+function tryRotate(board, piece, dir) {
+  const turned = rotated(piece, dir);
+  const offsets = kickOffsets(piece.id, piece.rot, turned.rot);
+  if (!offsets) return null;
+  for (const [dx, dy] of offsets) {
+    const candidate = movedBy(turned, dx, dy);
+    if (!collides(board, candidate)) return candidate;
+  }
+  return null;
+}
+
+/** 새 배열을 셔플해 반환한다. 인자를 변형하지 않는다. */
+function shuffled(items) {
+  const next = items.slice();
+  for (let i = next.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const swap = next[i];
+    next[i] = next[j];
+    next[j] = swap;
+  }
+  return next;
 }
 
 /* ============================================================
- * STATE — 보드, 현재 조각, 낙하 누적 시간, 종료 여부.
+ * STATE — 보드, 현재 조각, 7-bag 큐, 낙하 누적 시간, 종료 여부.
  * ============================================================ */
 const state = {
   board: createBoard(),
-  piece: spawnPiece(randomPieceId()),
+  piece: null,          // 아래에서 큐로부터 채운다
+  bag: [],              // 아직 뽑지 않은 현재 bag 의 조각 id
+  queue: [],            // 다음에 나올 조각 id. 항상 CONFIG.QUEUE_SIZE 이상
   dropAccumulatorMs: 0,
   isOver: false,
   lockedCount: 0,
   isSoftDropping: false,
 };
+
+/** 7-bag 에서 다음 조각 id 하나를 뽑는다. bag 이 비면 새로 셔플해 채운다. */
+function nextPieceId() {
+  if (state.bag.length === 0) {
+    state.bag = shuffled(PIECE_IDS).slice(0, CONFIG.BAG_SIZE);
+  }
+  const [head, ...rest] = state.bag;
+  state.bag = rest;
+  return head;
+}
+
+/** 큐를 CONFIG.QUEUE_SIZE 이상으로 채운다. */
+function refillQueue() {
+  while (state.queue.length < CONFIG.QUEUE_SIZE) {
+    state.queue = [...state.queue, nextPieceId()];
+  }
+}
+
+/** 큐 맨 앞 조각 id 를 꺼낸다. 꺼낸 뒤에도 큐 길이는 QUEUE_SIZE 이상이다. */
+function takeQueuedPieceId() {
+  refillQueue();
+  const [head, ...rest] = state.queue;
+  state.queue = rest;
+  refillQueue();
+  return head;
+}
+
+state.piece = spawnPiece(takeQueuedPieceId());
 
 /* ============================================================
  * RENDER — canvas 만 안다. 규칙은 모른다.
@@ -396,7 +498,7 @@ window.addEventListener('keyup', handleKeyUp);
 function lockAndSpawn() {
   state.board = lockPiece(state.board, state.piece);
   state.lockedCount++;
-  const spawned = spawnPiece(randomPieceId());
+  const spawned = spawnPiece(takeQueuedPieceId());
   if (collides(state.board, spawned)) {
     state.isOver = true;
     console.log('game over');
@@ -415,7 +517,7 @@ function stepDown() {
   lockAndSpawn();
 }
 
-/** 겹치지 않을 때만 조각을 교체한다. 겹치면 no-op (월킥은 T-003). */
+/** 겹치지 않을 때만 조각을 교체한다. 겹치면 no-op. 이동 경로가 쓴다. */
 function tryReplacePiece(candidate) {
   if (collides(state.board, candidate)) return;
   state.piece = candidate;
@@ -439,7 +541,8 @@ function applyIntent(intent) {
     return;
   }
   if (intent.type === 'rotate') {
-    tryReplacePiece(rotated(state.piece, intent.dir));
+    const rotatedPiece = tryRotate(state.board, state.piece, intent.dir);
+    if (rotatedPiece !== null) state.piece = rotatedPiece;
     return;
   }
   if (intent.type === 'softDrop') {
