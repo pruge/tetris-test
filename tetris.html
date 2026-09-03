@@ -497,6 +497,16 @@ const CONFIG = {
   LINES_PER_LEVEL: 10,      // 이만큼 지울 때마다 레벨 +1
   START_LEVEL: 1,
   LINE_SCORES: { 1: 100, 2: 300, 3: 500, 4: 800 },  // × 현재 레벨
+  TSPIN_SCORES: { 0: 400, 1: 800, 2: 1200, 3: 1600 },  // × 현재 레벨. LINE_SCORES 를 대체한다
+  TETRIS_LINE_COUNT: 4,     // 이 줄 수를 한 번에 지우면 '어려운 클리어'
+  B2B_MULTIPLIER: 1.5,      // 어려운 클리어가 연속될 때 두 번째부터 곱한다
+  COMBO_POINTS: 50,         // 콤보 보너스 = 이 값 × 콤보 수 × 레벨
+  NO_COMBO: -1,             // 연쇄 없음. 첫 클리어가 콤보 0 이 되도록 -1 에서 시작한다
+  T_PIECE_ID: 6,            // T 만 T-스핀 판정 대상이다
+  TSPIN_CORNER_THRESHOLD: 3,  // 3-corner 룰: 막힌 모서리가 이 수 이상이면 T-스핀
+  // T 의 회전 중심은 3x3 모양 상자의 (1,1) 이므로 네 모서리는 (0,0)(2,0)(0,2)(2,2).
+  // 모든 회전 상태에서 같은 오프셋이다.
+  TSPIN_CORNER_OFFSETS: [[0, 0], [2, 0], [0, 2], [2, 2]],
   SOFT_DROP_POINTS_PER_CELL: 1,
   HARD_DROP_POINTS_PER_CELL: 2,
   // 레벨별 낙하 간격(ms). 프레임 수가 아니라 ms 로 둬야 rAF 주기와 무관하다.
@@ -712,6 +722,58 @@ function lineClearScore(clearedCount, level) {
   return base === undefined ? 0 : base * level;
 }
 
+/** T-스핀으로 지운 줄 수와 레벨로 얻는 점수. 표에 없는 줄 수는 0점. */
+function tSpinScore(clearedCount, level) {
+  const base = CONFIG.TSPIN_SCORES[clearedCount];
+  return base === undefined ? 0 : base * level;
+}
+
+/** 콤보 보너스. 콤보 0(첫 클리어)은 0점, 이후 COMBO_POINTS × 콤보 × 레벨. */
+function comboScore(combo, level) {
+  if (combo <= 0) return 0;
+  return CONFIG.COMBO_POINTS * combo * level;
+}
+
+/** '어려운 클리어'인가 = 4줄 클리어이거나 줄을 지운 T-스핀.
+ *  줄을 지우지 않은 T-스핀은 어려운 클리어가 아니다. */
+function isHardClear(clearedCount, tSpin) {
+  if (clearedCount === 0) return false;
+  return tSpin || clearedCount === CONFIG.TETRIS_LINE_COUNT;
+}
+
+/** 고정 1회로 얻는 총점. 순수 함수 — 인자를 변형하지 않고 같은 입력에 같은 값.
+ *  T-스핀이면 LINE_SCORES 대신 TSPIN_SCORES 를 쓰고, B2B 는 줄 점수에만
+ *  곱한다. 콤보 보너스는 배수를 받지 않고 뒤에 더한다. */
+function clearScore({ clearedCount, level, tSpin, backToBack, combo }) {
+  const lines = tSpin
+    ? tSpinScore(clearedCount, level)
+    : lineClearScore(clearedCount, level);
+  const multiplied = backToBack ? lines * CONFIG.B2B_MULTIPLIER : lines;
+  return multiplied + comboScore(combo, level);
+}
+
+/** 그 칸이 막혀 있는가. 벽·바닥·기존 블록이 막힘이다.
+ *  천장 위(row < 0)는 collides 와 같게 열린 칸으로 본다. board 를 읽기만 한다. */
+function isBlockedCell(board, col, row) {
+  if (col < 0 || col >= CONFIG.COLS) return true;
+  if (row >= CONFIG.ROWS) return true;
+  if (row < 0) return false;
+  return board[cellIndex(col, row)] !== CONFIG.EMPTY;
+}
+
+/** 3-corner 룰 T-스핀 판정. 마지막 동작이 회전인 T 조각이고, 회전 중심의 네
+ *  모서리 중 TSPIN_CORNER_THRESHOLD 개 이상이 막혀 있으면 T-스핀이다.
+ *  tryRotate 의 시그니처를 바꾸지 않으려고 '마지막 동작이 회전이었는가'를
+ *  호출부에서 받는다. board 와 piece 를 읽기만 한다. */
+function isTSpin(board, piece, rotatedLast) {
+  if (!rotatedLast) return false;
+  if (piece.id !== CONFIG.T_PIECE_ID) return false;
+  const blocked = CONFIG.TSPIN_CORNER_OFFSETS.filter(
+    ([dx, dy]) => isBlockedCell(board, piece.x + dx, piece.y + dy)
+  ).length;
+  return blocked >= CONFIG.TSPIN_CORNER_THRESHOLD;
+}
+
 /** 누적 클리어 줄 수 -> 레벨. LINES_PER_LEVEL 줄마다 +1. */
 function levelForClearedLines(clearedLines) {
   const gained = Math.floor(clearedLines / CONFIG.LINES_PER_LEVEL);
@@ -802,6 +864,9 @@ const state = {
   score: 0,
   clearedLines: 0,
   level: CONFIG.START_LEVEL,
+  combo: CONFIG.NO_COMBO,        // 연속으로 줄을 지운 횟수 - 1. 첫 클리어가 0
+  isBackToBack: false,           // 직전 줄 클리어가 '어려운 클리어' 였는가
+  lastMoveWasRotation: false,    // T-스핀 판정용. 회전 성공 시 true, 이동·낙하 시 false
   isSoftDropping: false,
   hold: null,           // 보관 중인 조각 id. null 이면 보관함이 비어 있다
   canHold: true,        // 조각 하나가 고정될 때까지 홀드는 1회만
@@ -1185,21 +1250,36 @@ function noteLockReset() {
   state.lockTimerMs = 0;
 }
 
-/** 지운 줄 수를 점수·누적 줄 수·레벨에 반영한다. 점수는 레벨업 전 레벨 기준. */
-function applyLineClears(clearedCount) {
-  if (clearedCount === 0) return;
-  state.score += lineClearScore(clearedCount, state.level);
+/** 고정 1회의 결과를 점수·콤보·B2B·누적 줄 수·레벨에 반영한다.
+ *  점수는 레벨업 전 레벨 기준이다.
+ *  콤보는 줄을 못 지우면 끊기지만, B2B 연쇄는 '줄을 지운' 쉬운 클리어만 끊는다. */
+function applyLineClears(clearedCount, tSpin) {
+  const hardClear = isHardClear(clearedCount, tSpin);
+  const backToBack = hardClear && state.isBackToBack;
+  state.combo = clearedCount === 0 ? CONFIG.NO_COMBO : state.combo + 1;
+  state.score += clearScore({
+    clearedCount,
+    level: state.level,
+    tSpin,
+    backToBack,
+    combo: state.combo,
+  });
+  if (clearedCount === 0) return;   // 줄 없는 고정은 B2B 연쇄를 유지한다
+  state.isBackToBack = hardClear;
   state.clearedLines += clearedCount;
   state.level = levelForClearedLines(state.clearedLines);
 }
 
 /** 현재 조각을 고정하고, 줄을 지우고, 다음 조각을 스폰한다. */
 function lockAndSpawn() {
+  // 판정은 고정 전 보드로 한다. T 자신의 셀은 모서리 네 칸에 절대 걸리지 않는다.
+  const tSpin = isTSpin(state.board, state.piece, state.lastMoveWasRotation);
   const locked = lockPiece(state.board, state.piece);
   const cleared = clearLines(locked);
   state.board = cleared.board;
   state.lockedCount++;
-  applyLineClears(cleared.clearedRows.length);
+  applyLineClears(cleared.clearedRows.length, tSpin);
+  state.lastMoveWasRotation = false;   // 새 조각은 아직 아무 동작도 하지 않았다
   clearLockTimer();
   const spawned = spawnPiece(takeQueuedPieceId());
   if (collides(state.board, spawned)) {
@@ -1216,6 +1296,7 @@ function stepDown() {
   const next = movedDown(state.piece);
   if (collides(state.board, next)) return;
   state.piece = next;
+  state.lastMoveWasRotation = false;   // 낙하로 자리를 잡으면 T-스핀이 아니다
   if (state.isSoftDropping) state.score += CONFIG.SOFT_DROP_POINTS_PER_CELL;
 }
 
@@ -1247,6 +1328,8 @@ function hardDrop() {
     cells++;
   }
   state.piece = landed;
+  // 이미 접지한 조각의 하드 드롭은 움직이지 않으므로 회전 판정이 살아 있다.
+  if (cells > 0) state.lastMoveWasRotation = false;
   state.score += cells * CONFIG.HARD_DROP_POINTS_PER_CELL;
   lockAndSpawn();
   state.dropAccumulatorMs = 0;
@@ -1261,19 +1344,25 @@ function holdCurrentPiece() {
   state.piece = spawnPiece(storedId === null ? takeQueuedPieceId() : storedId);
   state.canHold = false;
   state.dropAccumulatorMs = 0;
+  state.lastMoveWasRotation = false;
   clearLockTimer();
 }
 
 function applyIntent(intent) {
   if (state.isOver) return;
   if (intent.type === 'move') {
-    if (tryReplacePiece(movedBy(state.piece, intent.dx, 0))) noteLockReset();
+    if (!tryReplacePiece(movedBy(state.piece, intent.dx, 0))) return;
+    state.lastMoveWasRotation = false;   // 이동으로 자리를 잡으면 T-스핀이 아니다
+    noteLockReset();
     return;
   }
   if (intent.type === 'rotate') {
+    // tryRotate 시그니처는 그대로 두고, '마지막 동작이 회전' 이라는 사실만
+    // 호출부인 여기서 기록한다. isTSpin 이 고정 시점에 이 값을 읽는다.
     const rotatedPiece = tryRotate(state.board, state.piece, intent.dir);
     if (rotatedPiece === null) return;
     state.piece = rotatedPiece;
+    state.lastMoveWasRotation = true;
     noteLockReset();
     return;
   }
